@@ -1,4 +1,4 @@
-# Elden Ring Appearance Copier — System Edition
+# Elden Ring Appearance Copier
 
 This package first uses Python and PySide6 already installed on the
 system. If PySide6 is unavailable, the launchers offer to install it into a
