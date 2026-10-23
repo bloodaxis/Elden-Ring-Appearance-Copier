@@ -20,8 +20,12 @@ SLOT_COUNT = 10
 USER_DATA_10_SIZE = 0x60010
 PROFILE_SIZE = 0x24C
 FACE_BUFFER_SIZE = 0x120
-FAVORITE_SIZE = 0x130
-FAVORITE_COUNT = 10
+# Each favorite record is a 0x10-byte header followed by the FaceDataBuffer.
+# Header byte 0 marks the record as used; the game ignores records without it.
+# Byte 1 is the favorite's body type (1 = type A, 0 = type B).
+FAVORITE_HEADER_SIZE = 0x10
+FAVORITE_SIZE = FAVORITE_HEADER_SIZE + FACE_BUFFER_SIZE
+FAVORITE_COUNT = 15
 
 
 def layout(data: bytes) -> dict[str, int]:
@@ -59,7 +63,45 @@ def face_offset_for_profile(offsets: dict[str, int], slot: int) -> int:
 
 
 def favorite_offset(offsets: dict[str, int], slot: int) -> int:
-    return offsets["menu_data"] + 0x18 + slot * FAVORITE_SIZE
+    """Return the offset of a favorite's FaceDataBuffer."""
+    return favorite_record_offset(offsets, slot) + FAVORITE_HEADER_SIZE
+
+
+def favorite_record_offset(offsets: dict[str, int], slot: int) -> int:
+    return offsets["menu_data"] + 8 + slot * FAVORITE_SIZE
+
+
+def favorite_record(data: bytes, offsets: dict[str, int], slot: int) -> bytes:
+    at = favorite_record_offset(offsets, slot)
+    return data[at : at + FAVORITE_SIZE]
+
+
+def favorite_is_used(data: bytes, offsets: dict[str, int], slot: int) -> bool:
+    record = favorite_record(data, offsets, slot)
+    return record[0] == 1 and face_is_valid(record[FAVORITE_HEADER_SIZE:])
+
+
+def favorite_has_data(data: bytes, offsets: dict[str, int], slot: int) -> bool:
+    return any(favorite_record(data, offsets, slot))
+
+
+def favorite_state(data: bytes, offsets: dict[str, int], slot: int) -> str:
+    if favorite_is_used(data, offsets, slot):
+        return "occupied"
+    return "hidden" if favorite_has_data(data, offsets, slot) else "empty"
+
+
+def favorite_body_type(data: bytes, offsets: dict[str, int], slot: int) -> int:
+    return favorite_record(data, offsets, slot)[1]
+
+
+def body_type_from_face(face: bytes) -> int:
+    """Convert the face's Elden Bling body-type value to the favorite header's.
+
+    Elden Bling JSON stores type B as 1 and type A as 3 in face byte 0x28;
+    the favorite header stores type B as 0 and type A as 1.
+    """
+    return 0 if face[0x28] == 1 else 1
 
 
 def decode_name(data: bytes, offsets: dict[str, int], slot: int) -> str:
@@ -109,9 +151,17 @@ def parse_location(value: str) -> tuple[str, int]:
         raise argparse.ArgumentTypeError(
             "location must be character:N or favorite:N"
         ) from error
-    if kind not in {"character", "favorite"} or not 0 <= slot < 10:
+    if kind == "character" and not 0 <= slot < SLOT_COUNT:
         raise argparse.ArgumentTypeError(
-            "location must be character:N or favorite:N, with N from 0 to 9"
+            f"character slot must be from 0 to {SLOT_COUNT - 1}"
+        )
+    if kind == "favorite" and not 0 <= slot < FAVORITE_COUNT:
+        raise argparse.ArgumentTypeError(
+            f"favorite slot must be from 0 to {FAVORITE_COUNT - 1}"
+        )
+    if kind not in {"character", "favorite"}:
+        raise argparse.ArgumentTypeError(
+            "location must be character:N or favorite:N"
         )
     return kind, slot
 
@@ -133,6 +183,8 @@ def read_appearance(
 ) -> bytes:
     kind, slot = location
     if kind == "favorite":
+        if not favorite_is_used(data, offsets, slot):
+            raise ValueError(f"favorite slot {slot} is empty")
         at = favorite_offset(offsets, slot)
     else:
         if data[offsets["active_slots"] + slot] != 1:
@@ -169,11 +221,11 @@ def inspect(data: bytes, offsets: dict[str, int]) -> None:
     print("Favorites:")
     for slot in range(FAVORITE_COUNT):
         at = favorite_offset(offsets, slot)
-        record = data[at : at + FAVORITE_SIZE]
-        face = record[:FACE_BUFFER_SIZE]
-        state = "occupied" if face_is_valid(face) else "empty" if not any(record) else "unknown"
-        digest = hashlib.sha256(face).hexdigest() if state == "occupied" else "-"
-        print(f"  {slot}: {state:8} offset=0x{at:X} sha256={digest}")
+        face = data[at : at + FACE_BUFFER_SIZE]
+        state = favorite_state(data, offsets, slot)
+        digest = hashlib.sha256(face).hexdigest() if face_is_valid(face) else "-"
+        body = favorite_body_type(data, offsets, slot) if state == "occupied" else "-"
+        print(f"  {slot}: {state:8} offset=0x{at:X} body_type={body} sha256={digest}")
 
 
 def write_appearance(
@@ -182,21 +234,24 @@ def write_appearance(
     destination: tuple[str, int],
     appearance: bytes,
     overwrite_favorite: bool,
+    body_type: int | None = None,
 ) -> bytes:
+    """Write one appearance; body_type only applies to favorite destinations
+    and is derived from the face when not given."""
     kind, slot = destination
     result = bytearray(data)
 
     if kind == "favorite":
-        at = favorite_offset(offsets, slot)
-        existing = data[at : at + FAVORITE_SIZE]
-        if any(existing) and not overwrite_favorite:
+        if favorite_has_data(data, offsets, slot) and not overwrite_favorite:
             raise ValueError(
                 f"favorite slot {slot} is occupied; pass --overwrite-favorite "
                 "to replace it"
             )
-        result[at : at + FAVORITE_SIZE] = appearance + bytes(
-            FAVORITE_SIZE - FACE_BUFFER_SIZE
-        )
+        if body_type is None:
+            body_type = body_type_from_face(appearance)
+        at = favorite_record_offset(offsets, slot)
+        header = bytes([1, body_type]) + bytes(FAVORITE_HEADER_SIZE - 2)
+        result[at : at + FAVORITE_SIZE] = header + appearance
     else:
         if data[offsets["active_slots"] + slot] != 1:
             raise ValueError(f"destination character slot {slot} is not active")
@@ -220,10 +275,10 @@ def write_appearance(
 def delete_favorite(data: bytes, offsets: dict[str, int], slot: int) -> bytes:
     """Clear one favorite record and repair the UserData10 checksum."""
     if not 0 <= slot < FAVORITE_COUNT:
-        raise ValueError("favorite slot must be from 0 to 9")
-    at = favorite_offset(offsets, slot)
-    if not any(data[at : at + FAVORITE_SIZE]):
+        raise ValueError(f"favorite slot must be from 0 to {FAVORITE_COUNT - 1}")
+    if not favorite_has_data(data, offsets, slot):
         raise ValueError(f"favorite slot {slot} is already empty")
+    at = favorite_record_offset(offsets, slot)
     result = bytearray(data)
     result[at : at + FAVORITE_SIZE] = bytes(FAVORITE_SIZE)
     user_data = offsets["user_data"]
@@ -267,6 +322,7 @@ def copy_appearance_files(
         destination,
         appearance,
         overwrite_favorite,
+        source_body_type(source_data, source_offsets, source),
     )
     result_offsets = layout(result)
     if not checksum_valid(result, result_offsets):
@@ -278,6 +334,14 @@ def copy_appearance_files(
 
     output.write_bytes(result)
     return hashlib.sha256(result).hexdigest()
+
+
+def source_body_type(
+    data: bytes, offsets: dict[str, int], source: tuple[str, int]
+) -> int | None:
+    """Keep a favorite's own body type when it is copied to another favorite."""
+    kind, slot = source
+    return favorite_body_type(data, offsets, slot) if kind == "favorite" else None
 
 
 def validate_save(data: bytes, offsets: dict[str, int], description: str) -> None:
@@ -310,6 +374,7 @@ def apply_appearance_operation(
         destination,
         appearance,
         overwrite_favorite,
+        source_body_type(source_data, source_offsets, source),
     )
 
 

@@ -138,9 +138,7 @@ class SavePane(QGroupBox):
                 text += f" ({source})"
             self._add_item(text, location, select)
         for slot in range(engine.FAVORITE_COUNT):
-            at = engine.favorite_offset(offsets, slot)
-            face = self.data[at:at + engine.FACE_BUFFER_SIZE]
-            state = "occupied" if engine.face_is_valid(face) else "empty"
+            state = engine.favorite_state(self.data, offsets, slot)
             location = ("favorite", slot)
             text = f"Favorite {slot}: {state}"
             if source := self.appearance_sources.get(location):
@@ -154,7 +152,7 @@ class SavePane(QGroupBox):
     def _add_item(self, text: str, location: tuple[str, int], select) -> None:
         item = QListWidgetItem(text)
         item.setData(Qt.UserRole, location)
-        if location[0] == "favorite" and text.endswith("empty"):
+        if location[0] == "favorite" and not text.endswith("occupied"):
             item.setForeground(Qt.darkGray)
         self.entries.addItem(item)
         if location == select:
@@ -170,6 +168,12 @@ class SavePane(QGroupBox):
             raise ValueError(f"Select an occupied character or favorite in {self.title()}")
         return engine.read_appearance(self.data, engine.layout(self.data), location)
 
+    def selected_body_type(self) -> int | None:
+        location = self.selected_location()
+        if self.data is None or location is None:
+            return None
+        return engine.source_body_type(self.data, engine.layout(self.data), location)
+
     def selected_appearance_source(self) -> str:
         location = self.selected_location()
         if self.data is None or location is None:
@@ -183,21 +187,26 @@ class SavePane(QGroupBox):
         return f"FaceData from {self.title()} favorite {slot}"
 
     def apply(
-        self, appearance: bytes, location: tuple[str, int], source: str | None = None
+        self,
+        appearance: bytes,
+        location: tuple[str, int],
+        source: str | None = None,
+        body_type: int | None = None,
     ) -> None:
         if self.data is None:
             raise ValueError(f"Open a save in {self.title()} first")
         offsets = engine.layout(self.data)
         overwrite = False
         if location[0] == "favorite":
-            at = engine.favorite_offset(offsets, location[1])
-            overwrite = any(self.data[at:at + engine.FAVORITE_SIZE])
+            overwrite = engine.favorite_has_data(self.data, offsets, location[1])
             if overwrite and QMessageBox.question(
                 self, "Replace favorite?", f"Favorite {location[1]} is occupied. Replace it?"
             ) != QMessageBox.Yes:
                 raise RuntimeError("Cancelled")
         self._remember(location)
-        self.data = engine.write_appearance(self.data, offsets, location, appearance, overwrite)
+        self.data = engine.write_appearance(
+            self.data, offsets, location, appearance, overwrite, body_type
+        )
         if source is None:
             self.appearance_sources.pop(location, None)
         else:
@@ -224,8 +233,7 @@ class SavePane(QGroupBox):
             )
             return
         offsets = engine.layout(self.data)
-        at = engine.favorite_offset(offsets, location[1])
-        if not any(self.data[at:at + engine.FAVORITE_SIZE]):
+        if not engine.favorite_has_data(self.data, offsets, location[1]):
             QMessageBox.information(self, "Already empty", f"Favorite {location[1]} is already empty.")
             return
         if QMessageBox.question(
@@ -351,7 +359,9 @@ class MainWindow(QMainWindow):
             appearance = source.selected_appearance()
             source_location = source.selected_location()
             source_description = source.selected_appearance_source()
-            destination.apply(appearance, location, source_description)
+            destination.apply(
+                appearance, location, source_description, source.selected_body_type()
+            )
         except RuntimeError:
             return
         except Exception as exception:
