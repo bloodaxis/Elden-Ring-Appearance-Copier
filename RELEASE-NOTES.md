@@ -1,3 +1,7 @@
+# Elden Ring Appearance Copier 0.1.1
+
+- Fixed some bugs with the favorites slots.
+
 # Elden Ring Appearance Copier 0.1.0
 
 Initial public release.
